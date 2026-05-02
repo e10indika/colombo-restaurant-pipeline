@@ -1,27 +1,26 @@
 """
-Colombo Restaurant Data Pipeline
-=================================
-Production-grade Google Places data collector with:
-  - Environment-variable API key (never hardcoded)
-  - Synthetic busyness score for trending/Part-A analysis
-  - Delta / append logic for time-series CSV
-  - PySpark loading step: schema validation, null audit, stats, Parquet output
-  - Structured logging
+part_a/01_data_collection.py
+==============================
+Step 01 — Data Collection via Google Places API.
+
+Collects Colombo restaurant data, enriches with synthetic busyness scores,
+appends to a historical CSV for time-series analysis, and hands off to
+02_data_loading.py for PySpark validation and Parquet persistence.
 
 Usage
 -----
-    export GOOGLE_API_KEY="your_key_here"
-    python pipeline.py
+    python part_a/01_data_collection.py
 
-Environment variables
----------------------
+Environment variables (set in project root .env)
+-------------------------------------------------
     GOOGLE_API_KEY   (required) Google Places API key
-    OUTPUT_FILE      (optional) one-shot snapshot CSV  [colombo_restaurants.csv]
-    HISTORICAL_FILE  (optional) append-only CSV        [data/historical_ratings.csv]
-    PARQUET_DIR      (optional) Parquet output dir     [data/restaurants.parquet]
+    OUTPUT_FILE      (optional) root snapshot CSV  [colombo_restaurants.csv]
+    HISTORICAL_FILE  (optional) delta CSV          [data/historical_ratings.csv]
+    PARQUET_DIR      (optional) Parquet output dir [data/restaurants.parquet]
 """
 
 import hashlib
+import importlib.util
 import logging
 import math
 import os
@@ -33,7 +32,21 @@ import pandas as pd
 import requests
 from tqdm import tqdm
 
-load_dotenv(Path(__file__).resolve().parent / '.env')
+# Project root is two levels up from part_a/
+ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(ROOT / '.env')   # load from project root, not part_a/
+
+# ── Import 02_data_loading by file path (digit prefix prevents standard import)
+def _import_02():
+    spec = importlib.util.spec_from_file_location(
+        "data_loading",
+        Path(__file__).resolve().parent / "02_data_loading.py",
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+load_into_spark = _import_02().load_into_spark
 
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -52,9 +65,9 @@ if not API_KEY:
         "Export it before running: export GOOGLE_API_KEY='your_key'"
     )
 
-OUTPUT_FILE      = os.getenv("OUTPUT_FILE",     "colombo_restaurants.csv")
-HISTORICAL_FILE  = os.getenv("HISTORICAL_FILE", os.path.join("data", "historical_ratings.csv"))
-PARQUET_DIR      = os.getenv("PARQUET_DIR",     os.path.join("data", "restaurants.parquet"))
+OUTPUT_FILE      = os.getenv("OUTPUT_FILE",     str(ROOT / "colombo_restaurants.csv"))
+HISTORICAL_FILE  = os.getenv("HISTORICAL_FILE", str(ROOT / "data" / "historical_ratings.csv"))
+PARQUET_DIR      = os.getenv("PARQUET_DIR",     str(ROOT / "data" / "restaurants.parquet"))
 SEARCH_RADIUS    = 3000   # metres per location
 
 # Colombo districts/areas
@@ -295,164 +308,6 @@ def append_to_historical(df: pd.DataFrame, historical_path: str) -> None:
     logger.info("%s historical file: %s  (+%d rows)", action, historical_path, len(df))
 
 
-# ── Step 6: Load into PySpark — validate, profile, and persist as Parquet ─────
-
-def load_into_spark(csv_path: str, parquet_dir: str) -> None:
-    """
-    Load the freshly written CSV into PySpark, perform schema validation,
-    null auditing, descriptive statistics, and save as Parquet.
-
-    Why Parquet?
-    - Columnar format: ~5–10× faster reads than CSV for analytics queries
-    - Schema-preserving: no type re-inference on every load
-    - Compressed: typically 60–80 % smaller than the equivalent CSV
-
-    Parameters
-    ----------
-    csv_path   : str   Path to the snapshot CSV just written by this run.
-    parquet_dir: str   Output directory for the Parquet dataset.
-    """
-    from pyspark.sql import SparkSession
-    from pyspark.sql import functions as F
-    from pyspark.sql.types import (
-        FloatType, IntegerType, StringType, StructField, StructType,
-    )
-
-    logger.info("── Spark loading step ──────────────────────────────────")
-
-    # ── 1. Start a minimal local SparkSession ─────────────────────────────────
-    spark = (
-        SparkSession.builder
-        .appName("ColomboRestaurantPipeline")
-        .master("local[*]")
-        .config("spark.driver.memory", "1g")
-        .config("spark.sql.shuffle.partitions", "4")
-        .config("spark.ui.enabled", "false")
-        .getOrCreate()
-    )
-    spark.sparkContext.setLogLevel("WARN")
-    logger.info("SparkSession started  (local[*])")
-
-    # ── 2. Explicit schema — no type guessing ─────────────────────────────────
-    schema = StructType([
-        StructField("place_id",          StringType(),  True),
-        StructField("name",              StringType(),  True),
-        StructField("address",           StringType(),  True),
-        StructField("lat",               FloatType(),   True),
-        StructField("lng",               FloatType(),   True),
-        StructField("rating",            FloatType(),   True),
-        StructField("total_ratings",     IntegerType(), True),
-        StructField("price_level",       IntegerType(), True),
-        StructField("busyness_score",    FloatType(),   True),
-        StructField("types",             StringType(),  True),
-        StructField("phone",             StringType(),  True),
-        StructField("website",           StringType(),  True),
-        StructField("open_now",          StringType(),  True),   # "True"/"False"/None
-        StructField("review_count",      IntegerType(), True),
-        StructField("review_texts",      StringType(),  True),
-        StructField("avg_review_rating", FloatType(),   True),
-        StructField("collected_at",      StringType(),  True),
-    ])
-
-    df = (
-        spark.read
-        .option("header", "true")
-        .option("nullValue", "")
-        .schema(schema)
-        .csv(csv_path)
-    )
-    df.cache()
-
-    total_rows = df.count()
-    logger.info("Rows loaded: %d", total_rows)
-
-    # ── 3. Schema validation ──────────────────────────────────────────────────
-    logger.info("── Schema")
-    for field in df.schema.fields:
-        logger.info("  %-22s %s", field.name, field.dataType.simpleString())
-
-    # ── 4. Null audit ─────────────────────────────────────────────────────────
-    logger.info("── Null audit  (column → null count)")
-    null_counts = df.select([
-        F.count(F.when(F.col(c).isNull(), c)).alias(c)
-        for c in df.columns
-    ]).collect()[0].asDict()
-
-    for col_name, n in null_counts.items():
-        if n > 0:
-            pct = round(n / total_rows * 100, 1)
-            logger.warning("  %-22s %4d nulls  (%s%%)", col_name, n, pct)
-        else:
-            logger.info("  %-22s  0 nulls", col_name)
-
-    # ── 5. Descriptive statistics on key numeric columns ──────────────────────
-    logger.info("── Descriptive statistics")
-    stats = df.select("rating", "total_ratings", "busyness_score", "price_level") \
-              .describe() \
-              .collect()
-
-    header = ["stat"] + ["rating", "total_ratings", "busyness_score", "price_level"]
-    logger.info("  %s", "  ".join(f"{h:<18}" for h in header))
-    for row in stats:
-        vals = [row["summary"]] + [
-            str(row[c])[:16] if row[c] is not None else "N/A"
-            for c in ["rating", "total_ratings", "busyness_score", "price_level"]
-        ]
-        logger.info("  %s", "  ".join(f"{v:<18}" for v in vals))
-
-    # ── 6. Quick insights ─────────────────────────────────────────────────────
-    logger.info("── Quick insights")
-
-    top_rated = (
-        df.filter(F.col("total_ratings") >= 50)
-          .orderBy(F.col("rating").desc())
-          .select("name", "rating", "total_ratings", "address")
-          .limit(5)
-          .collect()
-    )
-    logger.info("  Top 5 highest-rated (min 50 reviews):")
-    for r in top_rated:
-        logger.info("    %-35s  ★ %-4s  (%d reviews)", r["name"], r["rating"], r["total_ratings"])
-
-    busiest = (
-        df.orderBy(F.col("busyness_score").desc())
-          .select("name", "busyness_score", "address")
-          .limit(5)
-          .collect()
-    )
-    logger.info("  Top 5 busiest right now:")
-    for r in busiest:
-        logger.info("    %-35s  %s%%", r["name"], r["busyness_score"])
-
-    price_dist = (
-        df.groupBy("price_level")
-          .count()
-          .orderBy("price_level")
-          .collect()
-    )
-    logger.info("  Price level distribution:")
-    labels = {0: "Budget", 1: "Inexpensive", 2: "Moderate", 3: "Expensive", 4: "Very Expensive", None: "Unknown"}
-    for r in price_dist:
-        label = labels.get(r["price_level"], "Unknown")
-        logger.info("    Level %-2s  %-14s  %d restaurants",
-                    r["price_level"], f"({label})", r["count"])
-
-    # ── 7. Write Parquet (overwrite with latest snapshot) ─────────────────────
-    os.makedirs(os.path.dirname(parquet_dir) or ".", exist_ok=True)
-    (
-        df
-        .repartition(1)           # single file — small dataset
-        .write
-        .mode("overwrite")
-        .parquet(parquet_dir)
-    )
-    logger.info("Parquet saved → %s  (overwrites previous snapshot)", parquet_dir)
-
-    df.unpersist()
-    spark.stop()
-    logger.info("── Spark loading step complete ─────────────────────────")
-
-
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -477,6 +332,12 @@ def main() -> None:
     # 4. Write one-shot snapshot CSV (overwrites each run)
     df.to_csv(OUTPUT_FILE, index=False)
     logger.info("Snapshot written → %s", OUTPUT_FILE)
+
+    # 4b. Write canonical raw CSV for Part A cleaning step
+    raw_path = ROOT / "data" / "raw" / "colombo_restaurants_raw.csv"
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(str(raw_path), index=False)
+    logger.info("Raw data copy written → %s", raw_path)
 
     # 5. Append to historical CSV (never overwrites — delta / time-series)
     append_to_historical(df, HISTORICAL_FILE)

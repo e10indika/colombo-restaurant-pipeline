@@ -1,26 +1,50 @@
 """
-generate_mock_data.py — Generate realistic mock colombo_restaurants.csv
-without needing a Google Places API key.
+part_a/generate_mock_data.py
+==============================
+Generates 150 realistic mock restaurants for local development
+without requiring a Google Places API key.
 
-Usage:
-    python generate_mock_data.py
+Produces the same schema as 01_data_collection.py, then calls
+02_data_loading.py for PySpark validation and Parquet output.
 
-Outputs:
-    colombo_restaurants.csv       one-shot snapshot CSV
-    data/restaurants.parquet/     Parquet copy for fast analytics
+Usage
+-----
+    python part_a/generate_mock_data.py
+
+Outputs
+-------
+    colombo_restaurants.csv              root snapshot (overwritten each run)
+    data/raw/colombo_restaurants_raw.csv canonical raw CSV for 03_data_cleaning.py
+    data/restaurants.parquet/            Parquet copy
 """
 
 import csv
 import hashlib
+import importlib.util
 import math
 import os
 import random
+import shutil
 from datetime import datetime, timezone
+from pathlib import Path
 
 random.seed(42)
 
-OUTPUT_FILE  = os.getenv("OUTPUT_FILE",  "colombo_restaurants.csv")
-PARQUET_DIR  = os.getenv("PARQUET_DIR",  os.path.join("data", "restaurants.parquet"))
+ROOT        = Path(__file__).resolve().parent.parent
+OUTPUT_FILE = os.getenv("OUTPUT_FILE", str(ROOT / "colombo_restaurants.csv"))
+PARQUET_DIR = os.getenv("PARQUET_DIR", str(ROOT / "data" / "restaurants.parquet"))
+
+# Import load_into_spark from 02_data_loading.py by file path
+def _import_02():
+    spec = importlib.util.spec_from_file_location(
+        "data_loading",
+        Path(__file__).resolve().parent / "02_data_loading.py",
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+load_into_spark = _import_02().load_into_spark
 
 # ── Mock restaurant data ───────────────────────────────────────────────────────
 
@@ -161,8 +185,13 @@ def main():
 
     print(f"✅  Mock data generated: {len(records)} restaurants → {OUTPUT_FILE}")
 
-    # Load into PySpark for validation and Parquet output — same step as real pipeline
-    from pipeline import load_into_spark
+    # Write canonical raw CSV for 03_data_cleaning.py
+    raw_path = ROOT / "data" / "raw" / "colombo_restaurants_raw.csv"
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(OUTPUT_FILE, str(raw_path))
+    print(f"✅  Raw data copy → {raw_path}")
+
+    # Step 02: PySpark validation and Parquet output
     load_into_spark(OUTPUT_FILE, PARQUET_DIR)
 
 
