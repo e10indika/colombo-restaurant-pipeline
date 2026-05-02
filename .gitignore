@@ -13,3 +13,6 @@ colombo_restaurants.csv
 
 # macOS
 .DS_Store
+
+# Logs
+logs/
