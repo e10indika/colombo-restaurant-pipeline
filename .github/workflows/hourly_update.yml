@@ -1,11 +1,7 @@
-name: Hourly Restaurant Data Update
+name: Restaurant Data Update
 
 on:
-  # Run at the top of every hour
-  #schedule:
-  #  - cron: '0 * * * *'
-
-  # Allow manual trigger from the Actions tab
+  # Trigger manually from the Actions tab only
   workflow_dispatch:
 
 jobs:
@@ -21,31 +17,38 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          # Fetch full history so git log / diffs work correctly
           fetch-depth: 0
 
-      # ── 2. Set up Python ────────────────────────────────────────────────────
+      # ── 2. Set up Java (required by PySpark) ────────────────────────────────
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # ── 3. Set up Python ────────────────────────────────────────────────────
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
 
-      # ── 3. Install dependencies ─────────────────────────────────────────────
+      # ── 4. Install dependencies ─────────────────────────────────────────────
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      # ── 4. Run the pipeline ─────────────────────────────────────────────────
+      # ── 5. Run data collection ───────────────────────────────────────────────
       # GOOGLE_API_KEY is stored as a repository secret:
       #   Settings → Secrets and variables → Actions → New repository secret
-      - name: Run data pipeline
+      - name: Collect restaurant data
         env:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           HISTORICAL_FILE: data/historical_ratings.csv
           OUTPUT_FILE: colombo_restaurants.csv
-        run: python pipeline.py
+          PYTHONPATH: ${{ github.workspace }}
+        run: python part_a/01_data_collection.py
 
-      # ── 5. Commit & push updated CSV ─────────────────────────────────────────
+      # ── 6. Commit & push updated CSV ─────────────────────────────────────────
       # Only commits when the CSV actually changed (idempotent on empty runs).
       - name: Commit updated data files
         run: |
@@ -54,11 +57,10 @@ jobs:
 
           git add colombo_restaurants.csv data/historical_ratings.csv
 
-          # Exit cleanly if there is nothing new to commit
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
             TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
-            git commit -m "chore: hourly data update — ${TIMESTAMP}"
+            git commit -m "chore: restaurant data update — ${TIMESTAMP}"
             git push
           fi
