@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Secrets — never commit
+.env
+
+# Data files — large, auto-generated; track only via Git LFS if needed
+colombo_restaurants.csv
+# Note: data/historical_ratings.csv IS committed (it's the time-series store)
+
+# macOS
+.DS_Store
